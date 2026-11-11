@@ -1,0 +1,325 @@
+/*--------------------------------------------------------------------
+This source distribution is placed in the public domain by its author,
+Jason Papadopoulos. You may use it for any purpose, free of charge,
+without having to notify anyone. I disclaim any responsibility for any
+errors.
+
+Optionally, please be nice and tell me if you find this source to be
+useful. Again optionally, if you add to the functionality present here
+please consider making those additions public too, so that others may 
+benefit from your work.	
+
+$Id: stage1.h 1112 2026-11-02 02:13:30Z jasonp_sf $
+--------------------------------------------------------------------*/
+
+#ifndef _STAGE1_H_
+#define _STAGE1_H_
+
+/* Interface for selecting GNFS polynomials whose top
+   three coefficients are small. We use Kleinjung's improved
+   algorithm presented at the 2008 CADO Factoring Workshop,
+   with many modifications */
+
+#include <poly_skew.h>
+#include <cuda_xface.h>
+#include <thread.h>
+#include <sys/time.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define MAX_POLYSELECT_DEGREE 6
+
+#if MAX_POLY_DEGREE < MAX_POLYSELECT_DEGREE
+#error "supported poly degree must be at least 6"
+#endif
+
+/* we try to limit the high-order algebraic poly coefficient 
+   to the set with many small primes, to increase the odds 
+   that the resulting polynomial will have unusually many 
+   projective roots modulo small primes. */
+
+#define HIGH_COEFF_PRIME_LIMIT 100
+
+/* for practical reasons, we limit the size of product of
+   small primes that we look for in the high-order algebraic
+   coefficient. High coeffs larger than
+   HIGH_COEFF_MULTIPLIER * HIGH_COEFF_SIEVE_LIMIT
+   will have additional factors that may be large */
+
+#define HIGH_COEFF_SIEVE_LIMIT 1e12
+
+/*-----------------------------------------------------------------------*/
+
+/* main structure used in stage 1 */
+
+typedef struct {
+
+	uint32 degree;
+
+	mpz_t N;
+
+	/* bound on the norm used in stage 1; this is the maximum
+	   value of (poly coefficient i) * (optimal skew)^i across
+	   all poly coefficients. The low-order poly coefficients
+	   are bounded in size by m0, because the polynomial is
+	   essentially N split into d+1 pieces. Our job is to find
+	   a 'stage 1 hit' that obeys the norm bound even for the
+	   high-order algebraic coefficients */
+
+	double norm_max; 
+
+	/* the range on a_d, provided by calling code */
+
+	mpz_t gmp_high_coeff_begin;
+	mpz_t gmp_high_coeff_end;
+
+	/* function to call when a collision is found */
+
+	stage1_callback_t callback;
+	void *callback_data;
+
+	/* per-thread callback data for a multi-threaded stage 2
+	   (see poly_stage1_t) */
+	uint32 num_stage2_threads;
+	void **stage2_callback_data;
+
+	/* size optimization inside stage 1 (see poly_stage1_t) */
+	uint32 gpu_sizeopt;
+	double sizeopt_norm;
+	stage1_sizeopt_callback_t sizeopt_callback;
+
+	/* internal stuff */
+
+	mpz_t tmp1;
+
+} poly_search_t;
+
+
+/* data for searching a single leading coefficient */
+
+typedef struct {
+
+	uint32 degree;
+
+	mpz_t high_coeff; 
+
+	/* (computed) bound on the third-highest algebraic
+	   poly coefficient. Making this small is the only
+	   thing stage 1 can do; the other coefficients can
+	   only be optimized in stage 2 */
+
+	double coeff_max;
+
+	/* approximately (N/a_d) ^ (1/d) for input N, high
+	   coefficient a_d and poly degree d */
+
+	double m0;
+
+	/* bound on the leading rational poly coefficient */
+
+	double p_size_max;
+
+	/* internal values used */
+
+	mpz_t trans_N;
+	mpz_t trans_m0;
+	mpz_t m; 
+	mpz_t p;
+	mpz_t tmp1;
+	mpz_t tmp2;
+	mpz_t tmp3;
+} poly_coeff_t;
+
+poly_coeff_t * poly_coeff_init(void);
+void poly_coeff_free(poly_coeff_t *c);
+void poly_coeff_copy(poly_coeff_t *dest, poly_coeff_t *src);
+
+/*-----------------------------------------------------------------------*/
+
+#define MAX_SPECIAL_Q (0x7fffffffffffffffULL)
+#define P_BITS 31
+#define MAX_P (((uint32)1 << P_BITS) - 1)
+
+/* Kleinjung's algorithm essentially reduces to an
+   all-against-all search between two large collections of
+   arithmetic progressions, looking for pairs of progressions
+   that satisfy a specific modular property. The following
+   controls how much larger the largest element in a collection
+   is, compared to the smallest */
+
+#define P_SCALE 2.4
+
+/* Rational leading coeffs of NFS polynomials are assumed 
+   to be the product of 2 or 3 coprime groups of factors p; 
+   each p is < 2^32 and the product of (powers of) one or more
+   distinct primes. The arithmetic progressions mentioned 
+   above are of the form r_i + k * p^2 for 'root' r_i. 
+   p may be prime or composite.
+   
+   We get a collision when we can find two progressions 
+   aprog1(k) = r_i1 + k*p1^2 and aprog2(k) = r_i2+k*p2^2, 
+   and integers k1 and k2, such that
+
+   	- p1 and p2 are coprime
+	- aprog1(k1) = aprog2(k2)
+	- the common value is "close to" m0
+   
+   If p has several prime factors p_i, the exact number of 
+   roots that a given p has is the product of the number of 
+   d_th roots of N modulo each p_i. For degree 4 polyomials, N 
+   has either 0, 2, or 4 fourth roots mod p_i. For degree 5, 
+   N has either 1 or 5 fifth roots mod p_i. For degree 6, 
+   N has either 0, 2 or 6 sixth roots mod p_i. So especially
+   when p is large and p_i are small, a composite p can 
+   contribute a large number of progressions to the collision 
+   search
+
+   We will need to generate many p along with all their r_i
+   fairly often, and need efficient methods to do so */
+
+/* initialize and free the factory */
+
+void * sieve_fb_alloc(void);
+
+void sieve_fb_free(void *s_in);
+
+/* initialize the factory for a new leading algebraic 
+   coefficient. p is allowed to have small prime
+   factors p_i between factor_min and factor_max, and N
+   will have between fb_roots_min and fb_roots_max d_th
+   roots modulo each of these p_i. Additionally, if fb_only
+   is zero, a sieve is used to find any prime p which are
+   larger than factor_max */
+
+void sieve_fb_init(void *s_in, poly_coeff_t *coeff,
+			uint32 factor_min, uint32 factor_max,
+			uint32 fb_roots_min, uint32 fb_roots_max,
+			uint32 fb_only);
+
+/* set up for a run of p production. The generated p will 
+   all be between p_min and p_max, and the number of roots
+   for each p is between num_roots_min and num_roots_max 
+   (bounded by MAX_ROOTS) */
+
+#define MAX_ROOTS 31104
+
+void sieve_fb_reset(void *s_in, uint64 p_min, uint64 p_max,
+			uint32 num_roots_min, uint32 num_roots_max);
+
+/* function that 'does something' when a single p 
+   and all its roots is found */
+
+typedef void (*root_callback)(uint64 p, uint32 num_roots, mpz_t *roots, 
+				void *extra);
+
+/* find the next p and all of its roots. The code returns
+   P_SEARCH_DONE if no more p exist, otherwise it calls 
+   callback() and returns p.
+
+   p which are products of small primes are found first, then
+   large prime p (since prime p are slower and you may not want
+   all of them). Prime p will be found in ascending order but 
+   no order may be assumed for composite p returned by 
+   consecutive calls */
+
+#define P_SEARCH_DONE ((uint64)(-2))
+
+uint64 sieve_fb_next(void *s_in, poly_coeff_t *c, 
+			root_callback callback,
+			void *extra);
+
+/* nonzero: sieve_fb_next leaves the roots of p < 2^32 mod p, not
+   lifted to p^2 and shifted by m0 (the GPU kernel lift_qroots_q32
+   does that); used for special-q on the GPU */
+void sieve_fb_set_defer_lift(void *s_in, uint32 defer);
+
+/* an independent copy of an initialized factory that yields only the
+   part_id-th of part_count shares of its output (producer threads) */
+void * sieve_fb_clone(void *s_in, uint32 part_count, uint32 part_id);
+
+/*-----------------------------------------------------------------------*/
+
+typedef struct {
+
+	void *sieve_p_fb;
+	void *sieve_q_fb;
+	double cumulative_elapsed;
+	void *hw_thread_data;
+} stage1_sieve_thread_data_t;
+
+typedef struct {
+
+	msieve_obj *obj;
+	poly_search_t *poly;
+
+	uint32 num_threads;
+	stage1_sieve_thread_data_t * threads;
+
+	struct threadpool *stage1_threadpool;
+	struct threadpool *stage2_threadpool;
+	void * hw_data;
+
+	double min_specialq;  /* from 'min_specialq=', or 0 */
+
+	/* the wall-clock end of the search (0: none). The deadline was
+	   only the search's own CPU and GPU time, which barely grows while
+	   stage 1 waits for root optimization, and on the GPU it waits most
+	   of the time: a c90's 166 s ran 20 minutes */
+	double wall_end;
+} stage1_sieve_data_t;
+
+static INLINE double stage1_wall_now(void) {
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return tv.tv_sec + 1e-6 * tv.tv_usec;
+}
+
+typedef struct {
+	msieve_obj *obj;
+	poly_coeff_t *c;
+	stage1_sieve_data_t *d;
+	uint32 coeff_deadline;
+} task_data_t;
+
+/* GPU-specific */
+/* the GPUs for stage 1 (every GPU, or the one -g names); *num_threads:
+   asked for, set to the threads used (one to four per GPU; thread t
+   uses GPU t mod n) */
+void * gpu_sieve_data_init(msieve_obj * obj, uint32 *num_threads);
+void gpu_sieve_data_free(void * gpu_data);
+void gpu_thread_data_init(void *data, int threadid);
+void gpu_thread_data_free(void *data, int threadid);
+void stage1_specialq_gpu(task_data_t *task, uint32 threadid,
+			uint64 special_q_min, uint64 special_q_max, 
+			uint32 p_min, uint32 p_max);
+
+/* CPU-specific */
+void cpu_thread_data_init(void *data, int threadid);
+void cpu_thread_data_free(void *data, int threadid);
+void stage1_specialq_cpu(task_data_t *task, uint32 threadid,
+			uint64 special_q_min, uint64 special_q_max, 
+			uint32 p_min, uint32 p_max);
+
+/* 128-bit integers */
+
+typedef struct {
+	uint32 w[4];
+} uint128;
+
+/* queue a polynomial size-optimized in stage 1 for stage 2 */
+void stage1_sizeopt_submit(stage1_sieve_data_t *d, uint32 deg,
+			mpz_t *alg_coeffs, mpz_t *rat_coeffs,
+			double sizeopt_norm, double projective_alpha);
+
+void handle_collision(task_data_t *task, 
+			uint64 p, uint64 special_q,
+			uint128 special_q_root, int64 res);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* !_STAGE1_H_ */

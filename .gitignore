@@ -1,0 +1,12 @@
+.svn/
+*.o
+*.qo
+*.no
+*.a
+*.ptx
+*.so
+/msieve
+*.log
+*.aux
+*.toc
+*.out
